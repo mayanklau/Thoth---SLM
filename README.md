@@ -18,6 +18,7 @@ The project can:
 - prepare stratified train/validation/test splits,
 - fine-tune a small instruction model on GPU,
 - evaluate adapter checkpoints on held-out data.
+- score structured fields like risk tier, data classification, and injection detection.
 
 ## What is included
 
@@ -31,6 +32,7 @@ The project can:
 - `src/tscp_slm/hf_train.py`: GPU LoRA fine-tuning pipeline
 - `src/tscp_slm/hf_eval.py`: held-out evaluation for adapter checkpoints
 - `src/tscp_slm/hf_infer.py`: local inference with a fine-tuned adapter
+- `src/tscp_slm/targets.py`: TSCP-native target builder and parser
 - `data/training.jsonl`: expanded labeled dataset
 - `artifacts/`: trained model output
 - `tests/`: model and API tests
@@ -69,10 +71,12 @@ curl -X POST http://127.0.0.1:8000/v1/classify \
 ## Notes
 
 - The taxonomy here is still intentionally compact, but it is larger than the initial seed.
+- The taxonomy now covers 17 TSCP-oriented classes including model inversion, credential theft, privilege escalation, and data residency transfer.
 - You can expand `data/training.jsonl` as your labeled set grows.
 - The model file in `artifacts/` is portable JSON, so you can version it easily.
 - The API now returns TSCP-style fields such as `sis_id`, `intent`, `risk`, and `sensitivity`.
 - The baseline tests currently verify the lightweight path.
+- The evaluation path now reports macro F1 plus field-level accuracy for risk, classification, and injection signals.
 
 ## GPU SLM Path
 
@@ -109,6 +113,11 @@ PYTHONPATH=src python3 -m tscp_slm.hf_eval \
 
 - Ready now: baseline classifier, TSCP API, tests, dataset preparation, GPU fine-tuning scripts.
 - Not done yet: actual long-running GPU fine-tuning in this environment and real held-out SLM metrics from a trained adapter.
+
+## Baseline Validation
+
+- Full-dataset baseline check: `accuracy=1.0`, `macro_f1=1.0` on the current labeled corpus.
+- Held-out split baseline check: `accuracy=0.6471`, `macro_f1=0.5882`, `risk_accuracy=0.8235`, `injection_accuracy=1.0`.
 
 ## Docker
 

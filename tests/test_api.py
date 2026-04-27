@@ -20,6 +20,7 @@ def test_classify_endpoint_returns_tscp_shape() -> None:
     assert "sis_id" in payload
     assert "interaction_id" in payload
     assert payload["intent"]["primary_label"] == "DATA_EXFIL_DIRECT_PII"
+    assert payload["intent"]["secondary_labels"]
     assert payload["risk"]["tier"] == "CRITICAL"
 
 

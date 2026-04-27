@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Train model artifact
+        run: PYTHONPATH=src python -m tscp_slm.train --data data/training.jsonl --output artifacts/tscp_slm_model.json
+      - name: Evaluate model
+        run: PYTHONPATH=src python -m tscp_slm.evaluate --data data/training.jsonl --model artifacts/tscp_slm_model.json
+      - name: Run tests
+        run: PYTHONPATH=src pytest

@@ -8,6 +8,7 @@ from peft import AutoPeftModelForCausalLM
 from transformers import AutoTokenizer
 
 from .formatting import build_instruction
+from .targets import build_tscp_target, extract_json_object
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, str]]:
@@ -18,14 +19,6 @@ def load_jsonl(path: str | Path) -> list[dict[str, str]]:
             if line:
                 rows.append(json.loads(line))
     return rows
-
-
-def extract_label(text: str) -> str | None:
-    try:
-        payload = json.loads(text[text.find("{"): text.rfind("}") + 1])
-    except Exception:
-        return None
-    return payload.get("primary_label")
 
 
 def main() -> None:
@@ -43,18 +36,45 @@ def main() -> None:
     )
 
     rows = load_jsonl(args.test_file)
-    correct = 0
+    correct_label = 0
+    correct_risk = 0
+    correct_classification = 0
+    correct_injection = 0
+    parseable = 0
+
     for row in rows:
         prompt = build_instruction(row["text"])
         tokens = tokenizer(prompt, return_tensors="pt").to(model.device)
         outputs = model.generate(**tokens, max_new_tokens=args.max_new_tokens)
         decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        predicted = extract_label(decoded)
-        if predicted == row["label"]:
-            correct += 1
+        predicted = extract_json_object(decoded)
+        if predicted is None:
+            continue
+        parseable += 1
+        target = build_tscp_target(row["text"], row["label"])
+        if predicted.get("primary_label") == target["primary_label"]:
+            correct_label += 1
+        if predicted.get("risk_tier") == target["risk_tier"]:
+            correct_risk += 1
+        if predicted.get("data_classification") == target["data_classification"]:
+            correct_classification += 1
+        if bool(predicted.get("injection_detected")) == bool(target["injection_detected"]):
+            correct_injection += 1
 
-    accuracy = correct / len(rows) if rows else 0.0
-    print(json.dumps({"samples": len(rows), "correct": correct, "accuracy": round(accuracy, 4)}, indent=2))
+    total = len(rows) or 1
+    print(
+        json.dumps(
+            {
+                "samples": len(rows),
+                "parse_rate": round(parseable / total, 4),
+                "label_accuracy": round(correct_label / total, 4),
+                "risk_accuracy": round(correct_risk / total, 4),
+                "data_classification_accuracy": round(correct_classification / total, 4),
+                "injection_accuracy": round(correct_injection / total, 4),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

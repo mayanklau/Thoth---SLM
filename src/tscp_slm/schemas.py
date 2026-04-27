@@ -58,6 +58,20 @@ class SISSensitivity(BaseModel):
     data_classification: str
 
 
+class TSCPNativePrediction(BaseModel):
+    primary_label: str
+    secondary_labels: list[str]
+    risk_tier: str
+    risk_factors: list[str]
+    data_classification: str
+    pii_detected: bool
+    pii_entity_types: list[str]
+    injection_detected: bool
+    injection_type: str | None
+    category: str
+    label_description: str
+
+
 class ClassifyResponse(BaseModel):
     sis_id: str
     interaction_id: str

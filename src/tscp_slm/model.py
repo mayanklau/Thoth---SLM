@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
+import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 from .labels import LABEL_DESCRIPTIONS, RISK_BY_LABEL
 from .pii import detect_injection, detect_pii
+from .schemas import ClassifyRequest
 
 
 TOKEN_RE = re.compile(r"[a-zA-Z0-9_@.\-]+")
@@ -16,23 +19,51 @@ TOKEN_RE = re.compile(r"[a-zA-Z0-9_@.\-]+")
 
 @dataclass
 class Prediction:
+    sis_id: str
+    interaction_id: str
     label: str
     confidence: float
     risk_tier: str
+    risk_score: float
+    risk_factors: list[str]
     pii_detected: bool
-    pii_entities: list[str]
+    pii_entities: list[dict[str, str]]
+    data_classification: str
     injection_detected: bool
+    injection_type: str | None
     label_description: str
     evidence_tokens: list[str]
+    latency_ms: int
+    taxonomy_version: str = "TSCP-TAX-0.2"
+    classification_tier: str = "tier2"
+    cached: bool = False
 
     def to_dict(self) -> dict:
         return {
-            "label": self.label,
-            "confidence": round(self.confidence, 4),
-            "risk_tier": self.risk_tier,
-            "pii_detected": self.pii_detected,
-            "pii_entities": self.pii_entities,
+            "sis_id": self.sis_id,
+            "interaction_id": self.interaction_id,
+            "sis_version": "1.0",
+            "intent": {
+                "primary_label": self.label,
+                "secondary_labels": [],
+                "confidence": round(self.confidence, 4),
+                "taxonomy_version": self.taxonomy_version,
+                "classification_tier": self.classification_tier,
+            },
+            "risk": {
+                "tier": self.risk_tier,
+                "score": round(self.risk_score, 4),
+                "factors": self.risk_factors,
+            },
+            "sensitivity": {
+                "pii_detected": self.pii_detected,
+                "pii_entities": self.pii_entities,
+                "data_classification": self.data_classification,
+            },
             "injection_detected": self.injection_detected,
+            "injection_type": self.injection_type,
+            "processing_latency_ms": self.latency_ms,
+            "cached": self.cached,
             "label_description": self.label_description,
             "evidence_tokens": self.evidence_tokens,
         }
@@ -81,10 +112,11 @@ class TSCPMiniModel:
         self.class_totals = dict(class_totals)
         self.vocabulary = vocabulary
 
-    def predict(self, text: str) -> Prediction:
+    def predict(self, text: str, interaction_id: str | None = None) -> Prediction:
         if not self.class_priors:
             raise ValueError("Model is not trained.")
 
+        started = time.perf_counter()
         tokens = self.tokenize(text)
         vocab_size = max(1, len(self.vocabulary))
         log_scores: dict[str, float] = {}
@@ -108,20 +140,57 @@ class TSCPMiniModel:
 
         label = self._apply_overrides(best_label, pii_hits, injection_hit, text)
         evidence = self._top_evidence_tokens(label, tokens)
+        risk_factors = self._risk_factors(label, injection_hit, pii_hits, text)
+        latency_ms = max(1, int((time.perf_counter() - started) * 1000))
 
         return Prediction(
+            sis_id=f"sis_{uuid.uuid4().hex[:16]}",
+            interaction_id=interaction_id or f"int_{uuid.uuid4().hex[:16]}",
             label=label,
             confidence=confidence,
             risk_tier=RISK_BY_LABEL[label],
+            risk_score=self._risk_score(confidence, label, pii_hits, injection_hit),
+            risk_factors=risk_factors,
             pii_detected=bool(pii_hits),
-            pii_entities=sorted({hit.entity_type for hit in pii_hits}),
+            pii_entities=[{"type": hit.entity_type, "value": hit.value} for hit in pii_hits],
+            data_classification=self._data_classification(label, pii_hits),
             injection_detected=injection_hit,
+            injection_type=self._injection_type(injection_hit, text),
             label_description=LABEL_DESCRIPTIONS[label],
             evidence_tokens=evidence,
+            latency_ms=latency_ms,
         )
+
+    def classify_request(self, request: ClassifyRequest) -> Prediction:
+        text = request.content
+        if request.input_type.value == "rag_context" and "RAG" not in text:
+            text = f"retrieved context {text}"
+        if request.input_type.value == "tool_call" and "tool" not in text.lower():
+            text = f"tool workflow {text}"
+        return self.predict(text, interaction_id=request.interaction_id)
 
     def _apply_overrides(self, label: str, pii_hits: list, injection_hit: bool, text: str) -> str:
         lowered = text.lower()
+        if any(
+            phrase in lowered
+            for phrase in ["translate this hindi", "hinglish", "yeh customer", "mixed hindi-english", "mail ka professional response"]
+        ):
+            return "MULTILINGUAL_BUSINESS_QUERY"
+        if any(
+            phrase in lowered
+            for phrase in ["model output", "generated answer", "chatbot output", "before it is sent to the user"]
+        ):
+            return "OUTPUT_DATA_LEAKAGE_REVIEW"
+        if any(
+            phrase in lowered
+            for phrase in ["employee directory", "contact list", "email aliases", "slack channels", "office extensions"]
+        ):
+            return "INTERNAL_DIRECTORY_ACCESS"
+        if any(
+            phrase in lowered
+            for phrase in ["tool call", "tool workflow", "crm tool", "file uploader", "agent workflow", "chain database"]
+        ):
+            return "AGENTIC_TOOL_MISUSE"
         if injection_hit and any(word in lowered for word in ["retrieved", "knowledge base", "context", "chunk"]):
             return "RAG_INJECTION_INDIRECT"
         if injection_hit:
@@ -131,6 +200,11 @@ class TSCPMiniModel:
             for word in ["export", "list all", "share", "send me", "give me every", "dump", "reveal"]
         ):
             return "DATA_EXFIL_DIRECT_PII"
+        if any(
+            phrase in lowered
+            for phrase in ["hardcoded database password", "hardcoded", "plaintext logs", "disables tls", "secret key directly"]
+        ):
+            return "INSECURE_CODE_OUTPUT"
         if any(word in lowered for word in ["reverse shell", "keylogger", "sql injection", "steals browser cookies"]):
             return "MALICIOUS_CODE_GENERATION"
         return label
@@ -139,6 +213,51 @@ class TSCPMiniModel:
         counts = self.token_counts.get(label, {})
         ranked = sorted(set(tokens), key=lambda token: counts.get(token, 0), reverse=True)
         return ranked[:5]
+
+    def _risk_factors(self, label: str, injection_hit: bool, pii_hits: list, text: str) -> list[str]:
+        factors: list[str] = []
+        lowered = text.lower()
+        if injection_hit:
+            factors.append("prompt_injection")
+        if pii_hits:
+            factors.append("pii_detected")
+        if "tool" in lowered or "workflow" in lowered:
+            factors.append("agentic_flow")
+        if label in {"MALICIOUS_CODE_GENERATION", "INSECURE_CODE_OUTPUT"}:
+            factors.append("code_risk")
+        if label == "DATA_EXFIL_DIRECT_PII":
+            factors.append("direct_exfiltration")
+        if label == "SENSITIVE_DATA_ACCESS":
+            factors.append("restricted_content")
+        return factors
+
+    def _risk_score(self, confidence: float, label: str, pii_hits: list, injection_hit: bool) -> float:
+        base_by_tier = {"LOW": 0.2, "MEDIUM": 0.5, "HIGH": 0.75, "CRITICAL": 0.9}
+        score = base_by_tier[RISK_BY_LABEL[label]] + (confidence * 0.08)
+        if pii_hits:
+            score += 0.05
+        if injection_hit:
+            score += 0.05
+        return min(0.99, round(score, 4))
+
+    def _data_classification(self, label: str, pii_hits: list) -> str:
+        if label in {"DATA_EXFIL_DIRECT_PII", "MALICIOUS_CODE_GENERATION", "AGENTIC_TOOL_MISUSE"}:
+            return "RESTRICTED"
+        if pii_hits or label in {"SENSITIVE_DATA_ACCESS", "OUTPUT_DATA_LEAKAGE_REVIEW"}:
+            return "CONFIDENTIAL"
+        if label in {"SECURITY_COMPLIANCE_ASSIST", "INTERNAL_DIRECTORY_ACCESS", "INSECURE_CODE_OUTPUT"}:
+            return "INTERNAL"
+        return "PUBLIC"
+
+    def _injection_type(self, injection_hit: bool, text: str) -> str | None:
+        if not injection_hit:
+            return None
+        lowered = text.lower()
+        if any(word in lowered for word in ["retrieved", "knowledge base", "context", "chunk"]):
+            return "indirect_rag"
+        if "roleplay" in lowered:
+            return "roleplay"
+        return "direct"
 
     def save(self, path: str | Path) -> None:
         payload = {

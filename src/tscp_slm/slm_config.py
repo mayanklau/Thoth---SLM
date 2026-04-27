@@ -18,12 +18,15 @@ class SLMTrainConfig:
     per_device_eval_batch_size: int = 2
     gradient_accumulation_steps: int = 8
     warmup_ratio: float = 0.05
+    weight_decay: float = 0.01
     logging_steps: int = 10
     save_steps: int = 50
     eval_steps: int = 50
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
+    gradient_checkpointing: bool = True
+    bf16: bool = True
     seed: int = 42
 
     @classmethod
